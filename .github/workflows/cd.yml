@@ -1,0 +1,104 @@
+name: CD
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version
+        id: ver
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Tag harus vX.Y.Z"
+            exit 1
+          }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Patch release version
+        run: |
+          version="${{ steps.ver.outputs.version }}"
+          sed -i "s/^SCRIPT_VERSION=\".*\"/SCRIPT_VERSION=\"$version\"/" clickhouse-backup.sh
+          printf '%s\n' "$version" > VERSION
+          test "$(grep '^SCRIPT_VERSION=' clickhouse-backup.sh | cut -d'"' -f2)" = "$version"
+
+      - name: Lint release artifact
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck dash devscripts
+          shellcheck -s sh -S warning clickhouse-backup.sh install.sh tests/*.sh
+          checkbashisms -f -x clickhouse-backup.sh install.sh tests/*.sh
+          dash -n clickhouse-backup.sh
+          dash -n install.sh
+          sh tests/smoke.sh
+          sh tests/config.sh
+
+      - name: Generate checksums
+        run: |
+          sha256sum clickhouse-backup.sh > clickhouse-backup.sh.sha256
+          sha256sum install.sh > install.sh.sha256
+          sha256sum -c clickhouse-backup.sh.sha256
+          sha256sum -c install.sh.sha256
+
+      - name: Build ZIP
+        id: package
+        run: |
+          version="${{ steps.ver.outputs.version }}"
+          zip_name="devops-clickhouse-backup-v${version}.zip"
+          zip -r "$zip_name" \
+            clickhouse-backup.sh clickhouse-backup.sh.sha256 \
+            install.sh install.sh.sha256 \
+            VERSION README.md CHANGELOG.md backup.env.example \
+            .gitignore Makefile tests .github
+          sha256sum "$zip_name" > "$zip_name.sha256"
+          echo "zip=$zip_name" >> "$GITHUB_OUTPUT"
+
+      - name: Create release notes
+        run: |
+          {
+            echo "## Sismedika ClickHouse Backup ${{ steps.ver.outputs.tag }}"
+            echo
+            echo "### Install"
+            echo '```sh'
+            echo "curl -fsSL https://installer.dicu.my.id/clickhouse-backup | sudo sh -s -- --interactive"
+            echo '```'
+            echo
+            echo "Backends: S3 and rsync/SSH."
+            echo
+            echo "### Verify"
+            echo '```sh'
+            echo "sha256sum -c ${{ steps.package.outputs.zip }}.sha256"
+            echo '```'
+          } > release_notes.md
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: "clickhouse-backup ${{ steps.ver.outputs.tag }}"
+          body_path: release_notes.md
+          files: |
+            clickhouse-backup.sh
+            clickhouse-backup.sh.sha256
+            install.sh
+            install.sh.sha256
+            VERSION
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.zip }}.sha256
+          fail_on_unmatched_files: true

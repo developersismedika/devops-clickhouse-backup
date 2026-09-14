@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (POSIX sh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck dash devscripts
+
+      - name: ShellCheck
+        run: shellcheck -s sh -S warning clickhouse-backup.sh install.sh tests/*.sh
+
+      - name: checkbashisms
+        run: checkbashisms -f -x clickhouse-backup.sh install.sh tests/*.sh
+
+      - name: Syntax in sh, dash, bash
+        run: |
+          for f in clickhouse-backup.sh install.sh tests/*.sh; do
+            for shell in sh dash bash; do
+              "$shell" -n "$f" || {
+                echo "$f gagal $shell -n"
+                exit 1
+              }
+            done
+          done
+
+      - name: Version consistency
+        run: |
+          file_ver="$(cat VERSION)"
+          script_ver="$(grep '^SCRIPT_VERSION=' clickhouse-backup.sh | cut -d'"' -f2)"
+          test "$file_ver" = "$script_ver"
+          grep -q '^CLICKHOUSE_BACKUP_SCRIPT_ID="sismedika-clickhouse-backup"' clickhouse-backup.sh
+
+      - name: Verify committed checksums
+        run: |
+          sha256sum -c clickhouse-backup.sh.sha256
+          sha256sum -c install.sh.sha256
+
+  smoke:
+    name: Smoke (${{ matrix.image }})
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - debian:12-slim
+          - ubuntu:24.04
+          - alpine:3.21
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install runtime dependencies
+        run: |
+          if command -v apk >/dev/null 2>&1; then
+            apk add --no-cache bash coreutils grep openssh-client rsync >/dev/null
+          else
+            apt-get update -qq >/dev/null
+            apt-get install -y -qq bash coreutils grep openssh-client rsync >/dev/null
+          fi
+
+      - name: Smoke tests
+        run: |
+          sh tests/smoke.sh
+          sh tests/config.sh
+
+  installer:
+    name: Installer dry-run
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Installer tests
+        run: |
+          sh tests/installer.sh
+          sudo env \
+            PREFIX=/tmp/sismedika-clickhouse-backup-ci \
+            CLICKHOUSE_MODE=native \
+            BACKUP_BACKEND=rsync \
+            RSYNC_REMOTE_HOST=backup.internal \
+            RSYNC_REMOTE_USER=backup \
+            RSYNC_REMOTE_PATH=/backup/clickhouse \
+            sh install.sh --dry-run --non-interactive --skip-logsend
+
+  package:
+    name: Package reproducibility
+    needs: [lint, smoke, installer]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build package
+        run: |
+          make checksum
+          version="$(cat VERSION)"
+          zip -r "devops-clickhouse-backup-v${version}.zip" \
+            clickhouse-backup.sh clickhouse-backup.sh.sha256 \
+            install.sh install.sh.sha256 \
+            VERSION README.md CHANGELOG.md backup.env.example \
+            .gitignore Makefile tests .github
+
+      - name: Upload CI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: devops-clickhouse-backup-${{ github.sha }}
+          path: devops-clickhouse-backup-v*.zip
+          if-no-files-found: error

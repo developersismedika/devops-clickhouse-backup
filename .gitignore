@@ -1,0 +1,7 @@
+backup.env
+*.bak
+*.log
+.state
+.lock/
+spool/
+.DS_Store
