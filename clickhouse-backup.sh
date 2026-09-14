@@ -28,7 +28,7 @@ LC_ALL=C
 export LC_ALL
 
 CLICKHOUSE_BACKUP_SCRIPT_ID="sismedika-clickhouse-backup"
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 STATE_VERSION="1"
 APP_NAME="clickhouse-backup"
 SERVICE_USER="${SERVICE_USER:-root}"

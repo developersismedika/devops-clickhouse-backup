@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.0
+- Default install prefix changed to `/opt/sismedika-clickhouse-backup`.
+- Existing `/var/lib/sismedika-clickhouse-backup` installation is migrated automatically when safe.
+- Existing absolute paths in `backup.env` are rewritten to `/opt`.
+- Service/timer is reinstalled using the new agent path.
+- Compatibility symlink is retained at the legacy path.
+
 ## 1.4.0
 - GitHub Actions CI for POSIX lint, shell portability, smoke tests, installer dry-run, and package build.
 - Tag-based CD workflow creates checksums, ZIP artifact, and GitHub Release.

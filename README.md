@@ -29,7 +29,7 @@ sudo sh install.sh
 
 Installer akan:
 
-1. Membuat `/var/lib/sismedika-clickhouse-backup`.
+1. Membuat `/opt/sismedika-clickhouse-backup`.
 2. Memasang `clickhouse-backup.sh`.
 3. Mengunduh dan memverifikasi `logsend`, lalu menyimpannya sebagai
    `bin/logsend-clickhouse-backup`.
@@ -60,7 +60,7 @@ sudo \
 ## Layout hasil instalasi
 
 ```text
-/var/lib/sismedika-clickhouse-backup/
+/opt/sismedika-clickhouse-backup/
 ├── bin/
 │   ├── clickhouse-backup.sh
 │   ├── clickhouse-backup.sh.bak       # setelah update, bila ada
@@ -79,12 +79,12 @@ sudo \
 ## Perintah
 
 ```sh
-/var/lib/sismedika-clickhouse-backup/bin/clickhouse-backup.sh check
-/var/lib/sismedika-clickhouse-backup/bin/clickhouse-backup.sh status
-/var/lib/sismedika-clickhouse-backup/bin/clickhouse-backup.sh list
-/var/lib/sismedika-clickhouse-backup/bin/clickhouse-backup.sh backup
-/var/lib/sismedika-clickhouse-backup/bin/clickhouse-backup.sh backup full
-/var/lib/sismedika-clickhouse-backup/bin/clickhouse-backup.sh backup incremental
+/opt/sismedika-clickhouse-backup/bin/clickhouse-backup.sh check
+/opt/sismedika-clickhouse-backup/bin/clickhouse-backup.sh status
+/opt/sismedika-clickhouse-backup/bin/clickhouse-backup.sh list
+/opt/sismedika-clickhouse-backup/bin/clickhouse-backup.sh backup
+/opt/sismedika-clickhouse-backup/bin/clickhouse-backup.sh backup full
+/opt/sismedika-clickhouse-backup/bin/clickhouse-backup.sh backup incremental
 ```
 
 ## Jadwal
@@ -125,7 +125,7 @@ host-monitor:
   .../bin/logsend
 
 clickhouse-backup:
-  /var/lib/sismedika-clickhouse-backup/bin/logsend-clickhouse-backup
+  /opt/sismedika-clickhouse-backup/bin/logsend-clickhouse-backup
 ```
 
 ## Uninstall
@@ -161,7 +161,7 @@ Interactive wizard:
 
 ```text
 Backup backend [s3]: rsync
-Local staging root [/var/lib/sismedika-clickhouse-backup/var/data]:
+Local staging root [/opt/sismedika-clickhouse-backup/var/data]:
 Rsync remote host:
 Rsync remote user:
 SSH port [22]:
@@ -212,3 +212,26 @@ git push origin v1.4.0
 
 The release workflow validates the release artifact, regenerates SHA-256 files,
 builds the ZIP, and creates a GitHub Release.
+
+
+## Migrasi existing installation dari /var/lib
+
+Mulai v1.1.0, default prefix berubah menjadi:
+
+```text
+/opt/sismedika-clickhouse-backup
+```
+
+Jika installer menemukan existing installation lama di
+`/var/lib/sismedika-clickhouse-backup` dan path baru belum ada, installer
+otomatis:
+
+1. menghentikan timer/service backup,
+2. memindahkan seluruh installation tree ke `/opt/sismedika-clickhouse-backup`,
+3. mengganti referensi path lama di `etc/backup.env`,
+4. memasang agent terbaru,
+5. memasang ulang service/timer dengan `ExecStart` baru,
+6. membuat compatibility symlink dari path lama ke `/opt`.
+
+Jika path lama dan baru sama-sama berupa installation nyata, installer berhenti
+dan tidak melakukan merge otomatis.

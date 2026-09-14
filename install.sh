@@ -32,7 +32,9 @@ LOGSEND_REPO="${LOGSEND_REPO:-icaksh/opentelemetry-cli-send-log}"
 CHANNEL="${CHANNEL:-main}"
 PIN_VERSION="${PIN_VERSION:-}"
 
-PREFIX="${PREFIX:-/var/lib/$APP}"
+DEFAULT_PREFIX="${DEFAULT_PREFIX:-/opt/$APP}"
+LEGACY_PREFIX="${LEGACY_PREFIX:-/var/lib/$APP}"
+PREFIX="${PREFIX:-$DEFAULT_PREFIX}"
 BIN_DIR="$PREFIX/bin"
 ETC_DIR="$PREFIX/etc"
 VAR_DIR="$PREFIX/var"
@@ -79,6 +81,7 @@ DO_PURGE=0
 SKIP_LOGSEND="${SKIP_LOGSEND:-0}"
 INTERACTIVE=0
 NON_INTERACTIVE=0
+MIGRATED_LEGACY=0
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     C_B=$(printf '\033[1m'); C_G=$(printf '\033[32m')
@@ -300,6 +303,74 @@ sha_of() {
     esac
 }
 
+
+rewrite_legacy_paths() {
+    _file=$1
+    [ -f "$_file" ] || return 0
+
+    _tmp="${_file}.migrate.$$"
+    sed "s#${LEGACY_PREFIX}#${PREFIX}#g" "$_file" > "$_tmp" || {
+        rm -f "$_tmp"
+        return 1
+    }
+    chown root:root "$_tmp" 2>/dev/null || true
+    chmod 0600 "$_tmp" 2>/dev/null || true
+    mv -f "$_tmp" "$_file"
+}
+
+migrate_legacy_installation() {
+    # Only migrate the historical default layout into the new default layout.
+    [ "$PREFIX" = "$DEFAULT_PREFIX" ] || return 0
+    [ -e "$LEGACY_PREFIX" ] || return 0
+
+    # Previous migration may have left this compatibility symlink.
+    if [ -L "$LEGACY_PREFIX" ]; then
+        _target=$(readlink "$LEGACY_PREFIX" 2>/dev/null || true)
+        case "$_target" in
+            "$PREFIX"|"$DEFAULT_PREFIX")
+                say "legacy path sudah symlink ke $PREFIX"
+                return 0
+                ;;
+        esac
+    fi
+
+    if [ -e "$PREFIX" ]; then
+        die "legacy install ditemukan di $LEGACY_PREFIX tetapi $PREFIX juga sudah ada.
+Tidak dilakukan merge otomatis untuk mencegah kehilangan data.
+Periksa keduanya secara manual sebelum menjalankan installer lagi."
+    fi
+
+    step "Migrasi existing installation ke /opt"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        say "[dry-run] stop clickhouse-backup.timer/service"
+        say "[dry-run] mv $LEGACY_PREFIX -> $PREFIX"
+        say "[dry-run] rewrite path absolut di $PREFIX/etc/backup.env"
+        say "[dry-run] symlink $LEGACY_PREFIX -> $PREFIX"
+        MIGRATED_LEGACY=1
+        return 0
+    fi
+
+    if have systemctl; then
+        systemctl stop clickhouse-backup.timer 2>/dev/null || true
+        systemctl stop clickhouse-backup.service 2>/dev/null || true
+    fi
+
+    mkdir -p "$(dirname "$PREFIX")"
+    mv "$LEGACY_PREFIX" "$PREFIX" || die "gagal memindahkan $LEGACY_PREFIX ke $PREFIX"
+
+    rewrite_legacy_paths "$PREFIX/etc/backup.env" \
+        || die "gagal memperbarui path di backup.env"
+
+    # Compatibility only: data is physically under /opt.
+    ln -s "$PREFIX" "$LEGACY_PREFIX" \
+        || die "gagal membuat compatibility symlink"
+
+    MIGRATED_LEGACY=1
+    say "dipindah    : $LEGACY_PREFIX -> $PREFIX"
+    say "compat link : $LEGACY_PREFIX -> $PREFIX"
+}
+
 do_uninstall() {
     step "Melepas $APP"
     if [ -x "$AGENT" ]; then
@@ -308,6 +379,10 @@ do_uninstall() {
     run rm -rf "$BIN_DIR" "$ETC_DIR"
     if [ "$DO_PURGE" -eq 1 ]; then
         run rm -rf "$PREFIX"
+        if [ -L "$LEGACY_PREFIX" ]; then
+            _target=$(readlink "$LEGACY_PREFIX" 2>/dev/null || true)
+            [ "$_target" = "$PREFIX" ] && run rm -f "$LEGACY_PREFIX"
+        fi
         say "purge: $PREFIX"
     else
         say "runtime/log tetap di $VAR_DIR"
@@ -327,6 +402,8 @@ if [ "$LOCAL_BUNDLE" -eq 0 ]; then
     [ "$DOWNLOADER" != none ] || die "butuh curl/wget/fetch untuk remote install"
 fi
 
+migrate_legacy_installation
+
 step "Deteksi platform"
 if [ -d /run/systemd/system ] && have systemctl; then INIT=systemd
 elif have crontab || [ -d /etc/cron.d ]; then INIT=cron
@@ -335,6 +412,7 @@ fi
 say "os          : $OS ($MACH -> $ARCH)"
 say "init        : $INIT"
 say "prefix      : $PREFIX"
+[ "$MIGRATED_LEGACY" -eq 1 ] && say "migration   : $LEGACY_PREFIX -> $PREFIX"
 say "local bundle: $LOCAL_BUNDLE"
 
 step "Direktori"
