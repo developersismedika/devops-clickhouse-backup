@@ -22,7 +22,7 @@ Installer-style ClickHouse native S3 backup agent, mengikuti pola deployment
 ## Install dari ZIP / clone
 
 ```sh
-unzip devops-clickhouse-backup-v1.1.1.zip
+unzip devops-clickhouse-backup-v1.1.2.zip
 cd devops-clickhouse-backup
 sudo sh install.sh
 ```
@@ -206,8 +206,8 @@ the remote rsync complete successfully.
 `.github/workflows/cd.yml` runs for tags such as:
 
 ```sh
-git tag v1.1.1
-git push origin v1.1.1
+git tag v1.1.2
+git push origin v1.1.2
 ```
 
 The release workflow validates the release artifact, regenerates SHA-256 files,

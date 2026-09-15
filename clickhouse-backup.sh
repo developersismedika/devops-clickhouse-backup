@@ -30,7 +30,7 @@ export LC_ALL
 VERBOSE=0
 
 CLICKHOUSE_BACKUP_SCRIPT_ID="sismedika-clickhouse-backup"
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.1.2"
 STATE_VERSION="1"
 APP_NAME="clickhouse-backup"
 SERVICE_USER="${SERVICE_USER:-root}"
@@ -411,6 +411,10 @@ run_sql() {
     return "$rc"
 }
 
+ch_query() {
+    run_sql "$1"
+}
+
 query_scalar() {
     local q out
     q=$1
@@ -586,7 +590,7 @@ database_exists() {
     local db
     db=$1
     validate_database_name "$db" || return 1
-    ch_query "SELECT count() FROM system.databases WHERE name = '$db'" 2>/dev/null \
+    query_scalar "SELECT count() FROM system.databases WHERE name = '$db'" 2>/dev/null \
         | tr -d '\r\n ' | grep -q '^1$'
 }
 

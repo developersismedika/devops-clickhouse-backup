@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.1.2
+- Restored the missing `ch_query` wrapper used by database checks and verbose progress.
+
 ## 1.1.1
 - Release version aligned across `VERSION` and `SCRIPT_VERSION`.
 - Includes the current installer, backup backend, migration, and progress improvements.
