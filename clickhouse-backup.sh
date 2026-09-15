@@ -27,8 +27,10 @@ umask 077
 LC_ALL=C
 export LC_ALL
 
+VERBOSE=0
+
 CLICKHOUSE_BACKUP_SCRIPT_ID="sismedika-clickhouse-backup"
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 STATE_VERSION="1"
 APP_NAME="clickhouse-backup"
 SERVICE_USER="${SERVICE_USER:-root}"
@@ -39,6 +41,7 @@ _CLI_BACKUP_TIME="${BACKUP_TIME-}"
 have() { command -v "$1" >/dev/null 2>&1; }
 log()  { printf '%s\n' "$*"; }
 err()  { printf '%s\n' "$*" >&2; }
+verbose() { [ "$VERBOSE" -eq 1 ] && printf '[verbose] %s\n' "$*" >&2 || true; }
 
 resolve_self() {
     local src dir base r
@@ -146,10 +149,14 @@ CLICKHOUSE_HOST="${CLICKHOUSE_HOST:-127.0.0.1}"
 CLICKHOUSE_PORT="${CLICKHOUSE_PORT:-9000}"
 CLICKHOUSE_USER="${CLICKHOUSE_USER:-default}"
 CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD:-}"
+CLICKHOUSE_CONNECT_TIMEOUT="${CLICKHOUSE_CONNECT_TIMEOUT:-10}"
+CLICKHOUSE_SEND_TIMEOUT="${CLICKHOUSE_SEND_TIMEOUT:-3600}"
+CLICKHOUSE_RECEIVE_TIMEOUT="${CLICKHOUSE_RECEIVE_TIMEOUT:-3600}"
 CLICKHOUSE_SECURE="${CLICKHOUSE_SECURE:-false}"
 
 BACKUP_SCOPE="${BACKUP_SCOPE:-database}"           # database | all
 BACKUP_DATABASE="${BACKUP_DATABASE:-his_transformer}"
+BACKUP_DATABASES="${BACKUP_DATABASES:-}"
 
 BACKUP_BACKEND="${BACKUP_BACKEND:-s3}"             # s3 | rsync
 LOCAL_BACKUP_ROOT="${LOCAL_BACKUP_ROOT:-$PREFIX/var/data}"
@@ -189,9 +196,9 @@ LOGSEND_SPOOL_DIR="${LOGSEND_SPOOL_DIR:-$LOG_DIR/spool}"
 
 # Optional: bila true, BACKUP memakai ASYNC lalu dipoll. Default synchronous,
 # lebih sederhana dan exit code clickhouse-client langsung merepresentasikan job.
-BACKUP_ASYNC="${BACKUP_ASYNC:-false}"
+BACKUP_ASYNC="${BACKUP_ASYNC:-true}"
 BACKUP_POLL_INTERVAL="${BACKUP_POLL_INTERVAL:-10}"
-BACKUP_TIMEOUT_SEC="${BACKUP_TIMEOUT_SEC:-43200}"
+BACKUP_TIMEOUT_SEC="${BACKUP_TIMEOUT_SEC:-0}"
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -260,23 +267,7 @@ backup_target_expr() {
 }
 
 backup_object_expr() {
-    case "$BACKUP_SCOPE" in
-        all) BACKUP_OBJECT="ALL DATABASES" ;;
-        database)
-            # Database names cannot be parameterized. Allow conservative identifiers only.
-            case $BACKUP_DATABASE in
-                ''|*[!A-Za-z0-9_]*)
-                    err "$APP_NAME: BACKUP_DATABASE tidak valid: '$BACKUP_DATABASE'"
-                    return 1
-                    ;;
-            esac
-            BACKUP_OBJECT="DATABASE \`$BACKUP_DATABASE\`"
-            ;;
-        *)
-            err "$APP_NAME: BACKUP_SCOPE harus database atau all"
-            return 1
-            ;;
-    esac
+    build_database_object_list
 }
 
 acquire_lock() {
@@ -393,6 +384,9 @@ run_sql() {
             # shellcheck disable=SC2086
             printf '%s\n' "$sql" | docker exec -i "$CLICKHOUSE_CONTAINER" \
                 clickhouse-client \
+        --connect_timeout "$CLICKHOUSE_CONNECT_TIMEOUT" \
+        --send_timeout "$CLICKHOUSE_SEND_TIMEOUT" \
+        --receive_timeout "$CLICKHOUSE_RECEIVE_TIMEOUT" \
                 --user "$CLICKHOUSE_USER" \
                 --password "$CLICKHOUSE_PASSWORD" \
                 $secure_arg
@@ -558,6 +552,267 @@ sync_rsync_backend() {
     rsync $RSYNC_EXTRA_OPTS -e "$ssh_cmd" "$LOCAL_BACKUP_ROOT/" "$remote"
 }
 
+
+# -----------------------------------------------------------------------------
+# Database selection helpers
+# -----------------------------------------------------------------------------
+normalize_database_selection() {
+    # Backward compatibility for older configs:
+    # BACKUP_SCOPE=database + BACKUP_DATABASE="db1 db2"
+    if [ -z "${BACKUP_DATABASES:-}" ] && [ "${BACKUP_SCOPE:-database}" = database ]; then
+        case "$BACKUP_DATABASE" in
+            *" "*|*"	"*)
+                BACKUP_DATABASES=$BACKUP_DATABASE
+                BACKUP_SCOPE=databases
+                ;;
+        esac
+    fi
+
+    if [ "${BACKUP_SCOPE:-database}" = databases ] && [ -z "${BACKUP_DATABASES:-}" ]; then
+        BACKUP_DATABASES=$BACKUP_DATABASE
+    fi
+}
+
+validate_database_name() {
+    case "$1" in
+        ''|*[!A-Za-z0-9_]*)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+database_exists() {
+    local db
+    db=$1
+    validate_database_name "$db" || return 1
+    ch_query "SELECT count() FROM system.databases WHERE name = '$db'" 2>/dev/null \
+        | tr -d '\r\n ' | grep -q '^1$'
+}
+
+build_database_object_list() {
+    local db out
+    normalize_database_selection
+    out=''
+
+    case "$BACKUP_SCOPE" in
+        database)
+            validate_database_name "$BACKUP_DATABASE" || {
+                err "$APP_NAME: nama database tidak valid: $BACKUP_DATABASE"
+                return 1
+            }
+            BACKUP_OBJECT="DATABASE \`$BACKUP_DATABASE\`"
+            ;;
+        databases)
+            [ -n "$BACKUP_DATABASES" ] || {
+                err "$APP_NAME: BACKUP_DATABASES kosong"
+                return 1
+            }
+            for db in $BACKUP_DATABASES; do
+                validate_database_name "$db" || {
+                    err "$APP_NAME: nama database tidak valid: $db"
+                    return 1
+                }
+                if [ -n "$out" ]; then
+                    out="$out, "
+                fi
+                out="${out}DATABASE \`$db\`"
+            done
+            [ -n "$out" ] || return 1
+            BACKUP_OBJECT=$out
+            ;;
+        all)
+            BACKUP_OBJECT="ALL"
+            ;;
+        *)
+            err "$APP_NAME: BACKUP_SCOPE harus database, databases, atau all"
+            return 1
+            ;;
+    esac
+}
+
+check_selected_databases() {
+    local db rc
+    normalize_database_selection
+    rc=0
+
+    case "$BACKUP_SCOPE" in
+        database)
+            printf '  database            %s\n' "$BACKUP_DATABASE"
+            if database_exists "$BACKUP_DATABASE"; then
+                printf '  database status     OK\n'
+            else
+                printf '  database status     GAGAL\n'
+                rc=1
+            fi
+            ;;
+        databases)
+            printf '  databases           %s\n' "$BACKUP_DATABASES"
+            for db in $BACKUP_DATABASES; do
+                if database_exists "$db"; then
+                    printf '    %-18s OK\n' "$db"
+                else
+                    printf '    %-18s GAGAL\n' "$db"
+                    rc=1
+                fi
+            done
+            ;;
+        all)
+            printf '  database selection  ALL\n'
+            ;;
+        *)
+            printf '  database status     GAGAL - scope tidak dikenal\n'
+            rc=1
+            ;;
+    esac
+
+    return "$rc"
+}
+
+
+# -----------------------------------------------------------------------------
+# Verbose progress helpers
+# -----------------------------------------------------------------------------
+format_bytes() {
+    awk -v b="${1:-0}" 'BEGIN {
+        split("B KiB MiB GiB TiB PiB", u, " ");
+        i=1;
+        while (b >= 1024 && i < 6) { b=b/1024; i++ }
+        if (i == 1) printf "%.0f %s", b, u[i];
+        else printf "%.1f %s", b, u[i];
+    }'
+}
+
+format_duration() {
+    _sec=${1:-0}
+    [ "$_sec" -ge 0 ] 2>/dev/null || _sec=0
+    _d=$(( _sec / 86400 ))
+    _h=$(( (_sec % 86400) / 3600 ))
+    _m=$(( (_sec % 3600) / 60 ))
+    _s=$(( _sec % 60 ))
+    if [ "$_d" -gt 0 ]; then
+        printf '%dd %02d:%02d:%02d' "$_d" "$_h" "$_m" "$_s"
+    else
+        printf '%02d:%02d:%02d' "$_h" "$_m" "$_s"
+    fi
+}
+
+estimate_source_size() {
+    local db where
+    normalize_database_selection
+    where=''
+
+    case "$BACKUP_SCOPE" in
+        database)
+            validate_database_name "$BACKUP_DATABASE" || return 1
+            where="database = '$BACKUP_DATABASE'"
+            ;;
+        databases)
+            for db in $BACKUP_DATABASES; do
+                validate_database_name "$db" || return 1
+                if [ -n "$where" ]; then
+                    where="$where OR "
+                fi
+                where="${where}database = '$db'"
+            done
+            ;;
+        all)
+            where="database NOT IN ('system','information_schema','INFORMATION_SCHEMA')"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    SOURCE_EST_BYTES=$(ch_query "
+        SELECT toUInt64(coalesce(sum(bytes_on_disk), 0))
+        FROM system.parts
+        WHERE active AND ($where)
+    " 2>/dev/null | tr -d '\r\n ')
+
+    case "$SOURCE_EST_BYTES" in
+        ''|*[!0-9]*) SOURCE_EST_BYTES=0 ;;
+    esac
+    return 0
+}
+
+backup_progress_row() {
+    local dest q
+    dest=$1
+    sql_quote "$dest"
+    q=$SQL_QUOTED
+
+    # TSV: status, num_files, uncompressed_size, compressed_size, error
+    ch_query "
+        SELECT
+            status,
+            toUInt64(num_files),
+            toUInt64(uncompressed_size),
+            toUInt64(compressed_size),
+            replaceRegexpAll(error, '[\\r\\n\\t]+', ' ')
+        FROM system.backups
+        WHERE name = '$q'
+        ORDER BY start_time DESC
+        LIMIT 1
+        FORMAT TSVRaw
+    " 2>/dev/null
+}
+
+verbose_progress() {
+    local dest elapsed row status files unc comp error pct speed eta written source
+    dest=$1
+    elapsed=$2
+    source=${SOURCE_EST_BYTES:-0}
+
+    row=$(backup_progress_row "$dest" || true)
+    [ -n "$row" ] || {
+        verbose "backup poll: status=unknown elapsed=$(format_duration "$elapsed")"
+        return 0
+    }
+
+    status=$(printf '%s\n' "$row" | awk -F '\t' '{print $1}')
+    files=$(printf '%s\n' "$row" | awk -F '\t' '{print $2}')
+    unc=$(printf '%s\n' "$row" | awk -F '\t' '{print $3}')
+    comp=$(printf '%s\n' "$row" | awk -F '\t' '{print $4}')
+    error=$(printf '%s\n' "$row" | awk -F '\t' '{print $5}')
+
+    case "$unc" in ''|*[!0-9]*) unc=0 ;; esac
+    case "$comp" in ''|*[!0-9]*) comp=0 ;; esac
+    case "$files" in ''|*[!0-9]*) files=0 ;; esac
+
+    # Use uncompressed_size as the closest comparable measure to bytes_on_disk.
+    # This remains an estimate; ClickHouse backup representation can differ.
+    written=$unc
+    pct='n/a'
+    speed='n/a'
+    eta='n/a'
+
+    if [ "$source" -gt 0 ] 2>/dev/null; then
+        pct=$(awk -v w="$written" -v t="$source" 'BEGIN {
+            p=(t>0 ? w*100/t : 0);
+            if (p<0) p=0;
+            if (p>99.9) p=99.9;
+            printf "%.1f", p
+        }')
+        if [ "$elapsed" -gt 0 ] 2>/dev/null && [ "$written" -gt 0 ] 2>/dev/null; then
+            speed=$(awk -v w="$written" -v e="$elapsed" 'BEGIN { if(e>0) printf "%.0f", w/e; else print 0 }')
+            if [ "$speed" -gt 0 ] 2>/dev/null && [ "$written" -lt "$source" ] 2>/dev/null; then
+                eta=$(( (source - written) / speed ))
+            fi
+        fi
+    fi
+
+    if [ "$speed" != n/a ]; then
+        speed="$(format_bytes "$speed")/s"
+    fi
+    if [ "$eta" != n/a ]; then
+        eta=$(format_duration "$eta")
+    fi
+
+    verbose "backup poll: status=${status:-unknown} elapsed=$(format_duration "$elapsed") files=$files written=$(format_bytes "$written") source≈$(format_bytes "$source") progress≈${pct}% speed≈$speed eta≈$eta"
+    [ -n "$error" ] && [ "$error" != "0" ] && verbose "backup error: $error"
+}
+
 # -----------------------------------------------------------------------------
 # Backup operations
 # -----------------------------------------------------------------------------
@@ -633,7 +888,11 @@ wait_async_backup() {
 
         now=$(date +%s 2>/dev/null || printf 0)
         elapsed=$(( now - start ))
-        if [ "$start" -gt 0 ] && [ "$elapsed" -ge "$BACKUP_TIMEOUT_SEC" ]; then
+        if [ "$VERBOSE" -eq 1 ]; then
+            verbose_progress "$dest" "$elapsed"
+        fi
+
+        if [ "$BACKUP_TIMEOUT_SEC" -gt 0 ] && [ "$start" -gt 0 ] && [ "$elapsed" -ge "$BACKUP_TIMEOUT_SEC" ]; then
             err "$APP_NAME: timeout menunggu async backup (${BACKUP_TIMEOUT_SEC}s)"
             return 1
         fi
@@ -646,6 +905,13 @@ perform_backup() {
     mode=$1
     dest=$2
     base=${3-}
+
+    SOURCE_EST_BYTES=0
+    if [ "$VERBOSE" -eq 1 ]; then
+        estimate_source_size || true
+        verbose "backup start: mode=$mode destination=$dest base=${base:-none} async=$BACKUP_ASYNC"
+        verbose "source estimate: $(format_bytes "${SOURCE_EST_BYTES:-0}")"
+    fi
 
     build_backup_sql "$dest" "$base" "$mode" || return 1
     sql=$BACKUP_SQL
@@ -679,6 +945,7 @@ desired_backup_type() {
 }
 
 run_backup() {
+    normalize_database_selection
     local forced stamp day rel dest base msg fallback_rel fallback_dest started
     forced=${1-auto}
 
@@ -999,22 +1266,10 @@ run_check() {
     fi
 
     printf '  scope               %s\n' "$BACKUP_SCOPE"
-    if [ "$BACKUP_SCOPE" = database ]; then
-        printf '  database            %s\n' "$BACKUP_DATABASE"
-        db_ok=false
-        if [ "$ch_ok" = true ]; then
-            sql_quote "$BACKUP_DATABASE"; qdb=$SQL_QUOTED
-            if [ "$(query_scalar "SELECT count() FROM system.databases WHERE name='$qdb'" 2>/dev/null || printf 0)" = 1 ]; then
-                db_ok=true
-            fi
-        fi
-        if [ "$db_ok" = true ]; then
-            printf '  database status     OK\n'
-        else
-            printf '  database status     GAGAL\n'
-            rc=1
-        fi
+    if ! check_selected_databases; then
+        rc=1
     fi
+
 
     printf '\nStorage backend\n'
     printf '  backend             %s\n' "$BACKUP_BACKEND"
@@ -1055,6 +1310,11 @@ run_check() {
     printf '  time                %s\n' "$BACKUP_TIME"
     printf '  full day            %s (1=Mon ... 7=Sun)\n' "$FULL_BACKUP_DAY"
     printf '  async               %s\n' "$BACKUP_ASYNC"
+    if [ "$BACKUP_TIMEOUT_SEC" -eq 0 ]; then
+        printf '  backup timeout      unlimited\n'
+    else
+        printf '  backup timeout      %ss\n' "$BACKUP_TIMEOUT_SEC"
+    fi
 
     state_load
     printf '\nState\n'
@@ -1236,6 +1496,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=infinity
 ExecStart=$SCRIPT_PATH backup
 User=root
 Group=root
@@ -1333,6 +1594,9 @@ Penggunaan:
   $APP_NAME rollback
   $APP_NAME version
 
+Opsi global:
+  -v, --verbose     tampilkan progress detail/estimasi
+
 Environment:
   $ENV_FILE
 
@@ -1345,6 +1609,19 @@ EOF
 
 main() {
     local cmd arg
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -v|--verbose)
+                VERBOSE=1
+                shift
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
     cmd=${1-help}
     arg=${2-}
     case $cmd in

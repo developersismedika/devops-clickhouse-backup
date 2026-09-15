@@ -48,8 +48,12 @@ CLICKHOUSE_HOST="${CLICKHOUSE_HOST:-127.0.0.1}"
 CLICKHOUSE_PORT="${CLICKHOUSE_PORT:-9000}"
 CLICKHOUSE_USER="${CLICKHOUSE_USER:-clickhouse}"
 CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD:-}"
+CLICKHOUSE_CONNECT_TIMEOUT="${CLICKHOUSE_CONNECT_TIMEOUT:-10}"
+CLICKHOUSE_SEND_TIMEOUT="${CLICKHOUSE_SEND_TIMEOUT:-3600}"
+CLICKHOUSE_RECEIVE_TIMEOUT="${CLICKHOUSE_RECEIVE_TIMEOUT:-3600}"
 BACKUP_SCOPE="${BACKUP_SCOPE:-database}"
 BACKUP_DATABASE="${BACKUP_DATABASE:-his_transformer}"
+BACKUP_DATABASES="${BACKUP_DATABASES:-}"
 
 BACKUP_BACKEND="${BACKUP_BACKEND:-s3}"
 LOCAL_BACKUP_ROOT="${LOCAL_BACKUP_ROOT:-$PREFIX/var/data}"
@@ -127,7 +131,7 @@ Environment utama:
   CLICKHOUSE_MODE=docker|native
   CLICKHOUSE_CONTAINER
   CLICKHOUSE_USER / CLICKHOUSE_PASSWORD
-  BACKUP_SCOPE=database|all
+  BACKUP_SCOPE=database|databases|all
   BACKUP_DATABASE
   BACKUP_BACKEND=s3|rsync
   S3_ENDPOINT / S3_BUCKET / S3_PREFIX
@@ -196,10 +200,20 @@ run_wizard() {
     ask "ClickHouse user" "$CLICKHOUSE_USER"; CLICKHOUSE_USER=$REPLY
     [ -n "$CLICKHOUSE_PASSWORD" ] || { ask_secret "ClickHouse password"; CLICKHOUSE_PASSWORD=$REPLY; }
 
-    ask_choice "Backup scope" "$BACKUP_SCOPE" "database|all"; BACKUP_SCOPE=$REPLY
-    if [ "$BACKUP_SCOPE" = database ]; then
-        ask "Database" "$BACKUP_DATABASE"; BACKUP_DATABASE=$REPLY
-    fi
+    ask_choice "Backup scope" "$BACKUP_SCOPE" "database|databases|all"; BACKUP_SCOPE=$REPLY
+    case "$BACKUP_SCOPE" in
+        database)
+            ask "Database" "$BACKUP_DATABASE"; BACKUP_DATABASE=$REPLY
+            BACKUP_DATABASES=""
+            ;;
+        databases)
+            [ -n "$BACKUP_DATABASES" ] || BACKUP_DATABASES="$BACKUP_DATABASE"
+            ask "Databases (space-separated)" "$BACKUP_DATABASES"; BACKUP_DATABASES=$REPLY
+            ;;
+        all)
+            BACKUP_DATABASES=""
+            ;;
+    esac
 
     ask_choice "Backup backend" "$BACKUP_BACKEND" "s3|rsync"
     BACKUP_BACKEND=$REPLY
@@ -307,45 +321,30 @@ sha_of() {
 rewrite_legacy_paths() {
     _file=$1
     [ -f "$_file" ] || return 0
-
     _tmp="${_file}.migrate.$$"
     sed "s#${LEGACY_PREFIX}#${PREFIX}#g" "$_file" > "$_tmp" || {
-        rm -f "$_tmp"
-        return 1
+        rm -f "$_tmp"; return 1;
     }
-    chown root:root "$_tmp" 2>/dev/null || true
     chmod 0600 "$_tmp" 2>/dev/null || true
+    chown root:root "$_tmp" 2>/dev/null || true
     mv -f "$_tmp" "$_file"
 }
 
 migrate_legacy_installation() {
-    # Only migrate the historical default layout into the new default layout.
     [ "$PREFIX" = "$DEFAULT_PREFIX" ] || return 0
     [ -e "$LEGACY_PREFIX" ] || return 0
 
-    # Previous migration may have left this compatibility symlink.
     if [ -L "$LEGACY_PREFIX" ]; then
         _target=$(readlink "$LEGACY_PREFIX" 2>/dev/null || true)
-        case "$_target" in
-            "$PREFIX"|"$DEFAULT_PREFIX")
-                say "legacy path sudah symlink ke $PREFIX"
-                return 0
-                ;;
-        esac
+        [ "$_target" = "$PREFIX" ] && return 0
     fi
 
-    if [ -e "$PREFIX" ]; then
-        die "legacy install ditemukan di $LEGACY_PREFIX tetapi $PREFIX juga sudah ada.
-Tidak dilakukan merge otomatis untuk mencegah kehilangan data.
-Periksa keduanya secara manual sebelum menjalankan installer lagi."
-    fi
+    [ ! -e "$PREFIX" ] || die "legacy $LEGACY_PREFIX dan target $PREFIX sama-sama ada; merge otomatis dibatalkan"
 
     step "Migrasi existing installation ke /opt"
-
     if [ "$DRY_RUN" -eq 1 ]; then
-        say "[dry-run] stop clickhouse-backup.timer/service"
         say "[dry-run] mv $LEGACY_PREFIX -> $PREFIX"
-        say "[dry-run] rewrite path absolut di $PREFIX/etc/backup.env"
+        say "[dry-run] rewrite $PREFIX/etc/backup.env"
         say "[dry-run] symlink $LEGACY_PREFIX -> $PREFIX"
         MIGRATED_LEGACY=1
         return 0
@@ -355,20 +354,11 @@ Periksa keduanya secara manual sebelum menjalankan installer lagi."
         systemctl stop clickhouse-backup.timer 2>/dev/null || true
         systemctl stop clickhouse-backup.service 2>/dev/null || true
     fi
-
     mkdir -p "$(dirname "$PREFIX")"
-    mv "$LEGACY_PREFIX" "$PREFIX" || die "gagal memindahkan $LEGACY_PREFIX ke $PREFIX"
-
-    rewrite_legacy_paths "$PREFIX/etc/backup.env" \
-        || die "gagal memperbarui path di backup.env"
-
-    # Compatibility only: data is physically under /opt.
-    ln -s "$PREFIX" "$LEGACY_PREFIX" \
-        || die "gagal membuat compatibility symlink"
-
+    mv "$LEGACY_PREFIX" "$PREFIX"
+    rewrite_legacy_paths "$PREFIX/etc/backup.env" || die "rewrite backup.env gagal"
+    ln -s "$PREFIX" "$LEGACY_PREFIX"
     MIGRATED_LEGACY=1
-    say "dipindah    : $LEGACY_PREFIX -> $PREFIX"
-    say "compat link : $LEGACY_PREFIX -> $PREFIX"
 }
 
 do_uninstall() {
@@ -379,10 +369,6 @@ do_uninstall() {
     run rm -rf "$BIN_DIR" "$ETC_DIR"
     if [ "$DO_PURGE" -eq 1 ]; then
         run rm -rf "$PREFIX"
-        if [ -L "$LEGACY_PREFIX" ]; then
-            _target=$(readlink "$LEGACY_PREFIX" 2>/dev/null || true)
-            [ "$_target" = "$PREFIX" ] && run rm -f "$LEGACY_PREFIX"
-        fi
         say "purge: $PREFIX"
     else
         say "runtime/log tetap di $VAR_DIR"
@@ -412,7 +398,6 @@ fi
 say "os          : $OS ($MACH -> $ARCH)"
 say "init        : $INIT"
 say "prefix      : $PREFIX"
-[ "$MIGRATED_LEGACY" -eq 1 ] && say "migration   : $LEGACY_PREFIX -> $PREFIX"
 say "local bundle: $LOCAL_BUNDLE"
 
 step "Direktori"
@@ -506,9 +491,13 @@ CLICKHOUSE_HOST="$CLICKHOUSE_HOST"
 CLICKHOUSE_PORT="$CLICKHOUSE_PORT"
 CLICKHOUSE_USER="$CLICKHOUSE_USER"
 CLICKHOUSE_PASSWORD="$CLICKHOUSE_PASSWORD"
+CLICKHOUSE_CONNECT_TIMEOUT="$CLICKHOUSE_CONNECT_TIMEOUT"
+CLICKHOUSE_SEND_TIMEOUT="$CLICKHOUSE_SEND_TIMEOUT"
+CLICKHOUSE_RECEIVE_TIMEOUT="$CLICKHOUSE_RECEIVE_TIMEOUT"
 
 BACKUP_SCOPE="$BACKUP_SCOPE"
 BACKUP_DATABASE="$BACKUP_DATABASE"
+BACKUP_DATABASES="$BACKUP_DATABASES"
 
 BACKUP_BACKEND="$BACKUP_BACKEND"
 LOCAL_BACKUP_ROOT="$LOCAL_BACKUP_ROOT"
@@ -527,6 +516,7 @@ S3_SECRET_ACCESS_KEY="$S3_SECRET_ACCESS_KEY"
 
 FULL_BACKUP_DAY="$FULL_BACKUP_DAY"
 BACKUP_TIME="$BACKUP_TIME"
+BACKUP_TIMEOUT_SEC="$BACKUP_TIMEOUT_SEC"
 SYSTEMD_RANDOMIZED_DELAY="5m"
 
 OTLP_ENABLED="$OTLP_ENABLED"

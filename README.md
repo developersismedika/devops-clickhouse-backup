@@ -22,7 +22,7 @@ Installer-style ClickHouse native S3 backup agent, mengikuti pola deployment
 ## Install dari ZIP / clone
 
 ```sh
-unzip devops-clickhouse-backup-v1.4.0.zip
+unzip devops-clickhouse-backup-v1.1.1.zip
 cd devops-clickhouse-backup
 sudo sh install.sh
 ```
@@ -206,32 +206,67 @@ the remote rsync complete successfully.
 `.github/workflows/cd.yml` runs for tags such as:
 
 ```sh
-git tag v1.4.0
-git push origin v1.4.0
+git tag v1.1.1
+git push origin v1.1.1
 ```
 
 The release workflow validates the release artifact, regenerates SHA-256 files,
 builds the ZIP, and creates a GitHub Release.
 
 
-## Migrasi existing installation dari /var/lib
+## Multiple selected databases
 
-Mulai v1.1.0, default prefix berubah menjadi:
-
-```text
-/opt/sismedika-clickhouse-backup
+```sh
+BACKUP_SCOPE="databases"
+BACKUP_DATABASES="bronze primaya"
 ```
 
-Jika installer menemukan existing installation lama di
-`/var/lib/sismedika-clickhouse-backup` dan path baru belum ada, installer
-otomatis:
+This generates one native ClickHouse backup chain containing both selected
+databases. Preflight checks `bronze` and `primaya` separately.
 
-1. menghentikan timer/service backup,
-2. memindahkan seluruh installation tree ke `/opt/sismedika-clickhouse-backup`,
-3. mengganti referensi path lama di `etc/backup.env`,
-4. memasang agent terbaru,
-5. memasang ulang service/timer dengan `ExecStart` baru,
-6. membuat compatibility symlink dari path lama ke `/opt`.
+Old configs containing:
 
-Jika path lama dan baru sama-sama berupa installation nyata, installer berhenti
-dan tidak melakukan merge otomatis.
+```sh
+BACKUP_SCOPE="database"
+BACKUP_DATABASE="bronze primaya"
+```
+
+remain supported and are normalized at runtime to multi-database mode.
+
+
+## Long-running backup timeout
+
+Long full backups can exceed the ClickHouse client's default 300-second receive
+timeout. v1.3.0 configures:
+
+```sh
+CLICKHOUSE_CONNECT_TIMEOUT="10"
+CLICKHOUSE_SEND_TIMEOUT="3600"
+CLICKHOUSE_RECEIVE_TIMEOUT="3600"
+BACKUP_ASYNC="true"
+BACKUP_POLL_INTERVAL="10"
+BACKUP_TIMEOUT_SEC="43200"
+```
+
+`BACKUP_ASYNC=true` submits the backup asynchronously and polls
+`system.backups` until completion, avoiding a long-lived client connection.
+
+
+## Verbose progress estimation
+
+```sh
+/opt/sismedika-clickhouse-backup/bin/clickhouse-backup.sh --verbose backup full
+```
+
+Example:
+
+```text
+[verbose] backup start: mode=full destination=https://... async=true
+[verbose] source estimate: 487.2 GiB
+[verbose] backup poll: status=CREATING_BACKUP elapsed=00:50:03 files=18223 written=126.4 GiB source≈487.2 GiB progress≈25.9% speed≈43.1 MiB/s eta≈02:22:00
+```
+
+The percentage, throughput, and ETA are estimates. Source size comes from active
+`system.parts.bytes_on_disk`; written bytes come from `system.backups`.
+ClickHouse backup compression and representation can differ, so these values
+must not be treated as exact completion percentages.

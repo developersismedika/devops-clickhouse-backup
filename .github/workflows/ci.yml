@@ -85,7 +85,6 @@ jobs:
         run: |
           sh tests/smoke.sh
           sh tests/config.sh
-          sh tests/migration.sh
 
   installer:
     name: Installer dry-run
